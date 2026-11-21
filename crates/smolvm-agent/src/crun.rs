@@ -507,19 +507,10 @@ impl CrunCommand {
     /// server, an agent) survives across foreground execs, sharing the
     /// container view every other exec sees. Stdio is detached (no pipes to
     /// wait on), so the caller does not block.
-    pub fn exec_detached(
-        container_id: &str,
-        env: &[(String, String)],
-        command: &[String],
-        workdir: Option<&str>,
-        pid_file: Option<&Path>,
-    ) -> Self {
-        Self::exec_detached_with_log(container_id, env, command, workdir, pid_file, None)
-    }
-
-    /// [`exec_detached`](Self::exec_detached) with crun's own diagnostics
-    /// written to `log` (see [`workload_log_path`]), so a launch that fails
-    /// can say why without capturing the detached process's stdio.
+    ///
+    /// crun's own diagnostics are written to `log` (see [`workload_log_path`]),
+    /// so a launch that fails can say why without capturing the detached
+    /// process's stdio.
     pub fn exec_detached_with_log(
         container_id: &str,
         env: &[(String, String)],
@@ -758,8 +749,9 @@ impl CrunCommand {
 ///
 /// The directory holds only files that live while one crun call runs: the pid
 /// file of every exec ([`ExecPidFile`]), the process file of an exec whose user
-/// has supplementary groups (`exec-process/`), and the `--log` of a create or
-/// a workload launch (with the launch's pid file). On the storage disk,
+/// has supplementary groups (`exec-process/`), and the `--log` of a create, a
+/// workload launch or a background exec (with the launch's pid file). On the
+/// storage disk,
 /// every exec created and removed a file there, about 120 sectors with the
 /// journal commits, so a machine that was only polled kept writing its
 /// persistent disk and growing its branch and checkpoint deltas (smolvm#2357).

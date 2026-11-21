@@ -7736,6 +7736,31 @@ fn run_background_in_keepalive(
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
     );
 
+    // The keep-alive container is running, so a launch that fails in it is the
+    // answer. The caller's fresh-container fallback is for a machine without
+    // one, and would report the PID of a container that does not outlive the
+    // request.
+    match launch_background_exec(&cid, &launch, unprivileged) {
+        Ok(pid) => Ok(AgentResponse::Completed {
+            exit_code: 0,
+            stdout: format!("{pid}").into_bytes(),
+            stderr: Vec::new(),
+        }),
+        Err(error) => Ok(AgentResponse::error(
+            format!("background exec failed: {error}"),
+            error_codes::SPAWN_FAILED,
+        )),
+    }
+}
+
+/// Start `launch` detached in the running container `cid` and return the PID
+/// of the started process.
+#[cfg(target_os = "linux")]
+fn launch_background_exec(
+    cid: &str,
+    launch: &ResolvedLaunch,
+    unprivileged: bool,
+) -> Result<u32, Box<dyn std::error::Error>> {
     // Capture the detached process's PID via a pid-file so the response
     // honors the run-background contract (the host client parses a PID from
     // stdout). Unique per launch to avoid collisions between concurrent
@@ -7743,26 +7768,17 @@ fn run_background_in_keepalive(
     // On the run directory's tmpfs: after the persistent-rootfs pivot the
     // agent's /tmp is on the overlay disk.
     let pid_file = crun::ExecPidFile::new()?;
-    let pid = if !unprivileged {
-        if let Some(mut command) = restored_container_exec_command(&cid, &launch)? {
+    if !unprivileged {
+        if let Some(mut command) = restored_container_exec_command(cid, launch)? {
             let child = command
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()?;
-            child.id()
-        } else {
-            run_crun_background_exec(&cid, &launch, pid_file.path())?
+            return Ok(child.id());
         }
-    } else {
-        run_crun_background_exec(&cid, &launch, pid_file.path())?
-    };
-
-    Ok(AgentResponse::Completed {
-        exit_code: 0,
-        stdout: format!("{pid}").into_bytes(),
-        stderr: Vec::new(),
-    })
+    }
+    run_crun_background_exec(cid, launch, pid_file.path())
 }
 
 #[cfg(target_os = "linux")]
@@ -7772,32 +7788,63 @@ fn run_crun_background_exec(
     pid_file: &std::path::Path,
 ) -> Result<u32, Box<dyn std::error::Error>> {
     let process_file = exec_process_file_for(container_id, launch, false)?;
+    // The detached process inherits crun's stdout and stderr, so crun's own
+    // errors are read back from `--log`, as for the workload launch.
+    let log = pid_file.with_extension("log");
     let command = match &process_file {
-        Some(pf) => {
-            crun::CrunCommand::exec_detached_with_process(container_id, pf, Some(pid_file), None)
-        }
-        None => crun::CrunCommand::exec_detached(
+        Some(pf) => crun::CrunCommand::exec_detached_with_process(
+            container_id,
+            pf,
+            Some(pid_file),
+            Some(&log),
+        ),
+        None => crun::CrunCommand::exec_detached_with_log(
             container_id,
             &launch.env,
             &launch.command,
             launch.workdir.as_deref(),
             Some(pid_file),
+            Some(&log),
         )
         .user(launch.user.as_deref()),
     };
-    let status = command.stdin_null().discard_output().status()?;
+    let status = command.stdin_null().discard_output().status();
     drop(process_file);
+    let reason = crun::take_log(&log);
+    let status = status.map_err(|e| format!("run crun: {e}"))?;
+    Ok(background_exec_pid(
+        status,
+        &reason,
+        std::fs::read_to_string(pid_file),
+    )?)
+}
+
+/// The PID a `crun exec --detach` recorded in its pid file (`pid_file`, as
+/// read), or an error with crun's `reason` when it failed or recorded none: a
+/// PID the caller cannot signal is no answer.
+#[cfg(target_os = "linux")]
+fn background_exec_pid(
+    status: std::process::ExitStatus,
+    reason: &str,
+    pid_file: std::io::Result<String>,
+) -> Result<u32, String> {
+    let because = if reason.is_empty() {
+        " and reported nothing".to_string()
+    } else {
+        format!(": {reason}")
+    };
     if !status.success() {
-        return Err(format!(
-            "crun exec --detach failed (exit {})",
-            status.code().unwrap_or(-1)
-        )
-        .into());
+        return Err(format!("crun exec --detach {status}{because}"));
     }
-    Ok(std::fs::read_to_string(pid_file)
-        .ok()
-        .and_then(|value| value.trim().parse().ok())
-        .unwrap_or(0))
+    let text =
+        pid_file.map_err(|e| format!("crun exec --detach left no pid file ({e}){because}"))?;
+    match text.trim().parse::<u32>() {
+        Ok(pid) if pid > 0 => Ok(pid),
+        _ => Err(format!(
+            "crun exec --detach wrote no PID to its pid file ({:?}){because}",
+            text.trim()
+        )),
+    }
 }
 
 /// Non-streaming exec/run returns the whole output in a single wire frame. If it
@@ -9493,6 +9540,7 @@ impl<T: Read + Write + AsRawFd> ReadWrite for T {}
 #[cfg(all(test, target_os = "linux"))]
 mod exec_process_file_tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt as _;
 
     fn spec() -> oci::OciProcess {
         oci::OciProcess {
@@ -9532,6 +9580,31 @@ mod exec_process_file_tests {
         let path = process_file.to_path_buf();
         process_file.leave_for_sweep();
         assert!(path.exists());
+    }
+
+    #[test]
+    fn background_exec_pid_needs_a_pid_from_the_file() {
+        let ok = std::process::ExitStatus::from_raw(0);
+        let failed = std::process::ExitStatus::from_raw(1 << 8);
+        assert_eq!(background_exec_pid(ok, "", Ok("42\n".into())), Ok(42));
+
+        let error =
+            background_exec_pid(ok, "", Err(std::io::ErrorKind::NotFound.into())).unwrap_err();
+        assert!(error.contains("left no pid file"), "{error}");
+        let error = background_exec_pid(ok, "", Ok(String::new())).unwrap_err();
+        assert!(error.contains("wrote no PID"), "{error}");
+        let error = background_exec_pid(ok, "", Ok("0".into())).unwrap_err();
+        assert!(error.contains("wrote no PID"), "{error}");
+
+        let error = background_exec_pid(
+            failed,
+            "write pid file: No space left on device",
+            Ok("42".into()),
+        )
+        .unwrap_err();
+        assert!(error.contains("No space left on device"), "{error}");
+        let error = background_exec_pid(failed, "", Ok("42".into())).unwrap_err();
+        assert!(error.contains("reported nothing"), "{error}");
     }
 }
 
